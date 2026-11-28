@@ -202,19 +202,56 @@
     }
   }
 
+  let activeGeneralCleanup = null;
+  let activeGitHubCleanup = null;
+
+  function normalizeBlockedHostRule(raw) {
+    let s = String(raw || '').trim().toLowerCase();
+    if (!s) return '';
+    let wildcard = false;
+    if (s.startsWith('*.')) {
+      wildcard = true;
+      s = s.slice(2).trim();
+    }
+    if (!s) return '';
+    if (s.includes('://') || s.includes('/') || s.includes('?') || s.includes('#')) {
+      try {
+        const u = new URL(s.includes('://') ? s : `https://${s}`);
+        s = (u.hostname || '').toLowerCase();
+      } catch (_) {
+        s = s.replace(/^[a-z]+:\/\//i, '').split(/[/?#]/)[0];
+      }
+    }
+    if (!s.startsWith('[')) {
+      s = s.replace(/:\d+$/, '');
+    }
+    s = s.replace(/\.+$/, '').trim();
+    if (!s) return '';
+    return wildcard ? `*.${s}` : s;
+  }
+
+  function isRuleMatchingHost(rule, host) {
+    if (!rule || !host) return false;
+    if (rule === host) return true;
+    if (rule.startsWith('*.')) {
+      const suffix = rule.slice(2);
+      return Boolean(suffix) && (host === suffix || host.endsWith('.' + suffix));
+    }
+    return host.endsWith('.' + rule);
+  }
+
   function loadBlockedSites() {
     try {
       const raw = GM_getValue(STORAGE_KEYS.BLOCKED_SITES, []);
-      if (Array.isArray(raw)) return raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+      if (Array.isArray(raw)) {
+        return Array.from(new Set(raw.map(normalizeBlockedHostRule).filter(Boolean)));
+      }
     } catch (_) {}
     return [];
   }
 
-  let cachedBlockedSites = null;
-
   function saveBlockedSites(list) {
-    const clean = Array.from(new Set((list || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean)));
-    cachedBlockedSites = clean;
+    const clean = Array.from(new Set((list || []).map(normalizeBlockedHostRule).filter(Boolean)));
     try {
       GM_setValue(STORAGE_KEYS.BLOCKED_SITES, clean);
     } catch (_) {}
@@ -222,36 +259,41 @@
   }
 
   function isHostBlocked(hostname = location.hostname) {
-    const host = String(hostname || '').trim().toLowerCase();
+    const host = normalizeBlockedHostRule(hostname);
     if (!host) return false;
-    const list = cachedBlockedSites !== null ? cachedBlockedSites : (cachedBlockedSites = loadBlockedSites());
-    for (const rule of list) {
-      if (rule === host) return true;
-      if (rule.startsWith('*.')) {
-        const suffix = rule.slice(2);
-        if (host === suffix || host.endsWith('.' + suffix)) return true;
-      } else if (host.endsWith('.' + rule)) {
-        return true;
-      }
+    const list = loadBlockedSites();
+    return list.some((rule) => isRuleMatchingHost(rule, host));
+  }
+
+  function teardownForBlockedSite() {
+    setCurrentPageLineageMode('off');
+    if (typeof activeGitHubCleanup === 'function') {
+      activeGitHubCleanup();
+      activeGitHubCleanup = null;
     }
-    return false;
+    const ghBar = document.querySelector('.st-gh-standalone-bar');
+    if (ghBar) ghBar.remove();
+    if (typeof activeGeneralCleanup === 'function') {
+      activeGeneralCleanup();
+      activeGeneralCleanup = null;
+    }
+    const floating = document.getElementById('st-floating-host');
+    if (floating) floating.remove();
+    const imgDot = document.getElementById('st-img-dot-host');
+    if (imgDot) imgDot.style.setProperty('display', 'none', 'important');
   }
 
   function toggleBlockCurrentSite() {
-    const host = (location.hostname || '').toLowerCase();
+    const host = normalizeBlockedHostRule(location.hostname);
     if (!host) return;
     const list = loadBlockedSites();
-    const exists = list.includes(host);
-    if (exists) {
-      saveBlockedSites(list.filter((h) => h !== host));
+    if (list.some((rule) => isRuleMatchingHost(rule, host))) {
+      saveBlockedSites(list.filter((rule) => !isRuleMatchingHost(rule, host)));
       location.reload();
     } else {
       list.push(host);
       saveBlockedSites(list);
-      const floating = document.getElementById('st-floating-host');
-      if (floating) floating.remove();
-      const ghBar = document.querySelector('.st-gh-standalone-bar');
-      if (ghBar) ghBar.remove();
+      teardownForBlockedSite();
     }
   }
 
@@ -2494,17 +2536,17 @@
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addFn(); });
         addBar.append(input, addBtn);
       } else if (activeTab === 'blocked') {
-        const curHost = (location.hostname || '').toLowerCase();
+        const curHost = normalizeBlockedHostRule(location.hostname);
         const hostInput = createDomEl('input', {
           className: 'add-input',
           id: 'blocked-add-input',
           type: 'text',
-          placeholder: '输入屏蔽域名或通配符（如 example.com, *.corp.local）',
+          placeholder: '输入屏蔽域名、网址或通配符（如 example.com, *.corp.local）',
         });
         const addBtn = createDomEl('button', { className: 'btn primary', id: 'blocked-add-btn', type: 'button', textContent: '添加' });
         const blockCurBtn = createDomEl('button', { className: 'btn', id: 'blocked-cur-btn', type: 'button', textContent: '屏蔽当前网站' });
         const addHostFn = (val) => {
-          const items = String(val || '').split(/[,，\n]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+          const items = String(val || '').split(/[,，\n]+/).map(normalizeBlockedHostRule).filter(Boolean);
           if (items.length === 0) return;
           let added = 0;
           for (const item of items) {
@@ -2514,7 +2556,7 @@
             }
           }
           hostInput.value = '';
-          setTip(added > 0 ? `已添加 ${added} 个屏蔽域名` : '域名已在屏蔽列表中');
+          setTip(added > 0 ? `已添加 ${added} 个屏蔽域名（点击保存并应用生效）` : '域名已在屏蔽列表中');
           renderList();
         };
         addBtn.addEventListener('click', () => addHostFn(hostInput.value));
@@ -2749,8 +2791,7 @@
       saveBlockedSites(blockedList);
       clearAllTranslationCaches();
       if (isHostBlocked()) {
-        const floating = document.getElementById('st-floating-host');
-        if (floating) floating.remove();
+        teardownForBlockedSite();
       }
       close();
     });
@@ -3710,6 +3751,13 @@
   function initGeneralPageTranslator() {
     if (isHostBlocked()) return;
     if (document.getElementById('st-floating-host')) return;
+    if (typeof activeGeneralCleanup === 'function') {
+      activeGeneralCleanup();
+      activeGeneralCleanup = null;
+    }
+    let generalDisposed = false;
+    const generalAbort = typeof AbortController === 'function' ? new AbortController() : null;
+    const generalListenerOpts = generalAbort ? { signal: generalAbort.signal } : undefined;
     const pageIsChinese = isGeneralPageChinese();
 
     const host = document.createElement('div');
@@ -5303,6 +5351,7 @@
     }
 
     async function startPageTranslation(targetMode) {
+      if (generalDisposed || isHostBlocked()) return;
       if (currentMode === 'off') {
         cancelActiveSession();
         sessionAbortController = typeof AbortController === 'function' ? new AbortController() : null;
@@ -5326,6 +5375,7 @@
     // SPA 路由变化监听：页面切换时取消过期任务并按当前模式重新增量扫描
     let lastPageHref = location.href;
     function onSpaRouteChange() {
+      if (generalDisposed || isHostBlocked()) return;
       if (location.href === lastPageHref) return;
       lastPageHref = location.href;
       setCurrentPageLineageMode(currentMode);
@@ -5342,8 +5392,8 @@
       enqueueDirtyRoot(document.body, 220);
     }
 
-    window.addEventListener('popstate', onSpaRouteChange);
-    window.addEventListener('hashchange', onSpaRouteChange);
+    window.addEventListener('popstate', onSpaRouteChange, generalListenerOpts);
+    window.addEventListener('hashchange', onSpaRouteChange, generalListenerOpts);
     if (!history.__stPatched) {
       history.__stPatched = true;
       const origPushState = history.pushState;
@@ -5391,7 +5441,8 @@
       openGlossaryModal();
     });
 
-    onGlossaryUpdated(() => {
+    const offGeneralGlossary = onGlossaryUpdated(() => {
+      if (generalDisposed || isHostBlocked()) return;
       if (currentMode === 'off') return;
       const activeMode = currentMode;
       cancelActiveSession();
@@ -5424,7 +5475,7 @@
       altPeekEl = null;
     };
     document.addEventListener('mouseover', (e) => {
-      if (currentMode !== 'ch' || !e.altKey) return;
+      if (generalDisposed || currentMode !== 'ch' || !e.altKey) return;
       const el = e.target?.closest?.('[data-st-translated="1"]');
       if (!el || el === altPeekEl) return;
       clearAltPeek();
@@ -5433,13 +5484,14 @@
         altPeekEl = el;
         applyModeToElement(el, st, 'bilingual');
       }
-    }, true);
+    }, generalAbort ? { capture: true, signal: generalAbort.signal } : true);
     document.addEventListener('keyup', (e) => {
       if (e.key === 'Alt') clearAltPeek();
-    }, true);
+    }, generalAbort ? { capture: true, signal: generalAbort.signal } : true);
 
     // 快捷键支持：Alt+T 开关翻译，Alt+B 在双语与纯中文间快速切换（输入框内自动忽略）
     document.addEventListener('keydown', (e) => {
+      if (generalDisposed || isHostBlocked()) return;
       if (!e.altKey || e.ctrlKey || e.metaKey) return;
       const active = document.activeElement;
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
@@ -5453,14 +5505,30 @@
         if (currentMode === 'bilingual') startPageTranslation('ch');
         else startPageTranslation('bilingual');
       }
-    });
+    }, generalListenerOpts);
+
+    activeGeneralCleanup = () => {
+      if (generalDisposed) return;
+      generalDisposed = true;
+      offGeneralGlossary();
+      if (generalAbort) generalAbort.abort();
+      clearAltPeek();
+      currentMode = 'off';
+      setCurrentPageLineageMode('off');
+      cancelActiveSession();
+      stopDynamicObserver();
+      activeBatches = 0;
+      updateSpinner();
+      restoreAllElements();
+      host.remove();
+    };
 
     // 按来源页面继承翻译模式（必须先读取继承状态，再写入当前页状态，避免覆盖 sessionStorage / PAGE_MODES）
     const inherited = resolveInheritedModeForCurrentPage();
     if (!pageIsChinese && (inherited === 'bilingual' || inherited === 'ch')) {
       setCurrentPageLineageMode(inherited);
       setTimeout(() => {
-        if (currentMode === 'off' && !isHostBlocked()) {
+        if (!generalDisposed && currentMode === 'off' && !isHostBlocked()) {
           startPageTranslation(inherited);
         }
       }, 100);
@@ -7833,7 +7901,6 @@
   }
 
   const savedBodyChildrenMap = new WeakMap();
-  let activeGitHubCleanup = null;
 
   function initGitHubReadmeTranslator() {
     if (isHostBlocked()) return;
@@ -8397,6 +8464,7 @@
   // 9. 入口路由与 SPA / GitHub Turbo / PJAX 生命周期管理
   // ============================================================================
   function bootstrap() {
+    if (isHostBlocked()) return;
     bindNavigationLineageTracker();
     initImageDotTrigger();
     setTimeout(maybeSyncLanGlossary, 1500);
@@ -8405,6 +8473,10 @@
     if (isGitHub) {
       let ghInitTimer = null;
       const syncGitHubPageMode = () => {
+        if (isHostBlocked()) {
+          teardownForBlockedSite();
+          return;
+        }
         const hasReadme = Boolean(parseGitHubRepoInfo() && getLiveMarkdownBody());
         if (hasReadme) {
           const floating = document.getElementById('st-floating-host');
